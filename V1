@@ -1,0 +1,1765 @@
+--[[
+	FISHGUY HUD v3  (550 x 650)
+	Put in StarterPlayer > StarterPlayerScripts as a LocalScript.
+
+	  * Drag the light bar at the top to move the window
+	  * 5 clickable tabs: HOME / PLAYER / WORLD / THEME / SYSTEM (every page has buttons)
+	  * The reticle + parallax + grid reaction work anywhere on screen, not just over the window
+	  * H opens / closes the HUD (use it to bring the HUD back after CLOSE HUD)
+]]
+
+local Players          = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local RunService       = game:GetService("RunService")
+local TweenService     = game:GetService("TweenService")
+local Lighting         = game:GetService("Lighting")
+local Stats            = game:GetService("Stats")
+
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+
+-- Kill any previous copy of this HUD before making a new one, so re-running
+-- the script (or having it injected twice) never results in two GUIs.
+for _, name in ipairs({ "FishGuyHUD", "FishGuyCursor" }) do
+	local old = playerGui:FindFirstChild(name)
+	if old then old:Destroy() end
+end
+local rnd = Random.new()
+
+----------------------------------------------------------------
+-- Config / palette
+----------------------------------------------------------------
+local WIN_W, WIN_H = 550, 650
+local TOGGLE_KEY = Enum.KeyCode.H
+local HIDE_SYSTEM_CURSOR = true
+
+local BG      = Color3.fromRGB(28, 32, 37)
+local STRIPE  = Color3.fromRGB(36, 40, 46)
+local LIGHT   = Color3.fromRGB(200, 212, 218)
+local WHITE   = Color3.fromRGB(238, 244, 246)
+local MID     = Color3.fromRGB(120, 125, 130)
+local DIM     = Color3.fromRGB(72, 78, 84)
+local DARKTXT = Color3.fromRGB(64, 72, 80)
+local BTN_BG  = Color3.fromRGB(33, 38, 44)
+local GREEN   = Color3.fromRGB(0, 230, 155)
+local RED     = Color3.fromRGB(255, 70, 110)
+local CYAN    = Color3.fromRGB(60, 240, 255)
+
+local FONT_HEAD  = Enum.Font.Michroma
+local FONT_SMALL = Enum.Font.Code
+local FONT_BOLD  = Enum.Font.GothamBold
+local LEFT, CENTER, RIGHT = Enum.TextXAlignment.Left, Enum.TextXAlignment.Center, Enum.TextXAlignment.Right
+
+local CFG = { parallax = true, reticle = true, glitch = true, kick = true, parMul = 1 }
+
+----------------------------------------------------------------
+-- Accent color system (theme tab recolors everything registered)
+----------------------------------------------------------------
+local ACC = { color = GREEN, name = "EMERALD", token = nil }
+local accented, accentFns = {}, {}
+
+local function reg(inst, prop)
+	table.insert(accented, { inst = inst, prop = prop or "BackgroundColor3" })
+	return inst
+end
+
+local function applyAccent(c)
+	ACC.color = c
+	for _, r in ipairs(accented) do
+		r.inst[r.prop] = c
+	end
+	for _, fn in ipairs(accentFns) do
+		fn(c)
+	end
+end
+
+local function setAccent(new)
+	local old = ACC.color
+	local token = {}
+	ACC.token = token
+	task.spawn(function()
+		for i = 1, 16 do
+			if ACC.token ~= token then return end
+			applyAccent(old:Lerp(new, i / 16))
+			task.wait(0.02)
+		end
+	end)
+end
+
+----------------------------------------------------------------
+-- Helpers
+----------------------------------------------------------------
+local function box(parent, x, y, w, h, color, transparency)
+	local f = Instance.new("Frame")
+	f.BorderSizePixel = 0
+	f.BackgroundColor3 = color or LIGHT
+	f.BackgroundTransparency = transparency or 0
+	f.Position = UDim2.fromOffset(x, y)
+	f.Size = UDim2.fromOffset(w, h)
+	f.Parent = parent
+	return f
+end
+
+local function outline(parent, x, y, w, h, color, thickness)
+	local f = box(parent, x, y, w, h, color, 1)
+	local s = Instance.new("UIStroke")
+	s.Color = color or MID
+	s.Thickness = thickness or 1
+	s.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+	s.Parent = f
+	return f, s
+end
+
+local function circle(parent, cx, cy, r, color, thickness, transparency)
+	local f = Instance.new("Frame")
+	f.AnchorPoint = Vector2.new(0.5, 0.5)
+	f.Position = UDim2.fromOffset(cx, cy)
+	f.Size = UDim2.fromOffset(r * 2, r * 2)
+	f.BackgroundTransparency = 1
+	f.BorderSizePixel = 0
+	f.Parent = parent
+	local c = Instance.new("UICorner")
+	c.CornerRadius = UDim.new(1, 0)
+	c.Parent = f
+	local s = Instance.new("UIStroke")
+	s.Color = color or LIGHT
+	s.Thickness = thickness or 1
+	s.Transparency = transparency or 0
+	s.Parent = f
+	return f, s
+end
+
+local function label(parent, text, x, y, w, h, size, color, align, font)
+	local t = Instance.new("TextLabel")
+	t.BackgroundTransparency = 1
+	t.Position = UDim2.fromOffset(x, y)
+	t.Size = UDim2.fromOffset(w, h)
+	t.Text = text
+	t.TextSize = size or 12
+	t.TextColor3 = color or LIGHT
+	t.Font = font or FONT_SMALL
+	t.TextXAlignment = align or LEFT
+	t.Parent = parent
+	return t
+end
+
+local function tween(obj, time, props, style, dir)
+	local tw = TweenService:Create(obj, TweenInfo.new(time, style or Enum.EasingStyle.Quint, dir or Enum.EasingDirection.Out), props)
+	tw:Play()
+	return tw
+end
+
+local function tweenWait(obj, time, props, style, dir)
+	local tw = tween(obj, time, props, style, dir)
+	tw.Completed:Wait()
+end
+
+-- text "decode" effect
+local SCR = "01#%$@&*<>/=+"
+local scrambleTokens = setmetatable({}, { __mode = "k" })
+local function scramble(lbl, final, dur)
+	local token = {}
+	scrambleTokens[lbl] = token
+	task.spawn(function()
+		local steps = math.max(1, math.floor(dur / 0.03))
+		for s = 1, steps do
+			if scrambleTokens[lbl] ~= token then return end
+			local resolved = math.floor(#final * s / steps)
+			local out = {}
+			for c = 1, #final do
+				if c <= resolved or string.sub(final, c, c) == " " then
+					out[c] = string.sub(final, c, c)
+				else
+					local k = rnd:NextInteger(1, #SCR)
+					out[c] = string.sub(SCR, k, k)
+				end
+			end
+			lbl.Text = table.concat(out)
+			task.wait(0.03)
+		end
+		if scrambleTokens[lbl] == token then lbl.Text = final end
+	end)
+end
+
+-- console log queue
+local logQueue = {}
+local function log(msg)
+	table.insert(logQueue, "> " .. msg)
+	while #logQueue > 6 do table.remove(logQueue, 1) end
+end
+
+local function getPing()
+	local ok, v = pcall(function()
+		return Stats.Network.ServerStatsItem["Data Ping"]:GetValue()
+	end)
+	return ok and math.floor(v) or nil
+end
+
+----------------------------------------------------------------
+-- Shared state
+----------------------------------------------------------------
+local ready, busy = false, false
+local minimized = false
+local dragging = false
+local kick = Vector2.zero
+local scanBoost = 0
+local glitchOff = Vector2.zero
+local currentPage, pageGen = 1, 0
+local hovered = {}          -- buttons currently under the mouse
+local fpsValue = 60
+local t = 0
+local openWindow, closeWindow
+
+----------------------------------------------------------------
+-- Root: window (shutter mask) > inner (fixed 550x650 canvas)
+----------------------------------------------------------------
+local gui = Instance.new("ScreenGui")
+gui.Name = "FishGuyHUD"
+gui.IgnoreGuiInset = true
+gui.ResetOnSpawn = false
+gui.DisplayOrder = 10
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+gui.Parent = playerGui
+
+local window = Instance.new("Frame")
+window.Name = "Window"
+window.AnchorPoint = Vector2.new(0.5, 0.5)
+window.Position = UDim2.fromScale(0.5, 0.5)
+window.Size = UDim2.fromOffset(0, 2)
+window.BackgroundColor3 = GREEN
+window.BorderSizePixel = 0
+window.ClipsDescendants = true
+window.Visible = false
+window.Parent = gui
+
+local inner = Instance.new("Frame")
+inner.Name = "Inner"
+inner.AnchorPoint = Vector2.new(0.5, 0.5)
+inner.Position = UDim2.fromScale(0.5, 0.5)
+inner.Size = UDim2.fromOffset(WIN_W, WIN_H)
+inner.BackgroundColor3 = BG
+inner.BorderSizePixel = 0
+inner.Visible = false
+inner.Parent = window
+
+----------------------------------------------------------------
+-- Parallax layers
+----------------------------------------------------------------
+local layers = {}
+local function newLayer(name, z, shift, zoom, extra, glitchy)
+	extra = extra or 0
+	local f = Instance.new("Frame")
+	f.Name = name
+	f.AnchorPoint = Vector2.new(0.5, 0.5)
+	f.Position = UDim2.fromOffset(WIN_W / 2, WIN_H / 2)
+	f.Size = UDim2.fromOffset(WIN_W + extra, WIN_H + extra)
+	f.BackgroundTransparency = 1
+	f.BorderSizePixel = 0
+	f.ZIndex = z
+	f.Parent = inner
+	local sc = Instance.new("UIScale")
+	sc.Parent = f
+	table.insert(layers, { frame = f, shift = shift, zoom = zoom or 0, scale = sc, glitchy = glitchy })
+	return f
+end
+
+local bgLayer    = newLayer("Background", 1, 4, 0, 60)
+local gridLayer  = newLayer("Grid", 2, 8, 0.004)
+local midLayer   = newLayer("Pages", 3, 10, 0.006)
+local gaugeLayer = newLayer("Gauges", 4, 16, 0.012)
+local frontLayer = newLayer("Front", 5, 20, 0.02, 0, true)
+
+----------------------------------------------------------------
+-- BACKGROUND stripes + GRID
+----------------------------------------------------------------
+local stripeHolder = box(bgLayer, 0, 0, WIN_W + 60, WIN_H + 60, BG, 1)
+for i = -5, 14 do
+	local bar = box(stripeHolder, i * 70, -100, 28, 900, STRIPE)
+	bar.Rotation = 35
+end
+
+local plusList = {}
+for i = 0, 8 do
+	for j = 0, 7 do
+		local x, y = 55 + i * 55, 125 + j * 50
+		local l = label(gridLayer, "+", x - 10, y - 10, 20, 20, 14, DIM, CENTER)
+		table.insert(plusList, { l = l, x = x, y = y })
+	end
+end
+
+----------------------------------------------------------------
+-- FRONT LAYER: header, title, console, readouts
+----------------------------------------------------------------
+box(frontLayer, 35, 98, 115, 1.5, MID)
+local rise = box(frontLayer, 147.5, 87.25, 27, 1.5, MID)
+rise.Rotation = -48
+box(frontLayer, 170, 77, 84, 1.5, MID)
+local pageTag = label(frontLayer, "[ 01/05 ]", 190, 58, 80, 14, 11, LIGHT, LEFT)
+label(frontLayer, "/ //", 268, 70, 50, 24, 22, MID, LEFT, FONT_BOLD)
+
+box(frontLayer, 392, 58, 36, 10, LIGHT)
+label(frontLayer, "SRC", 392, 58, 36, 10, 8, BG, CENTER)
+outline(frontLayer, 436, 58, 24, 10, MID)
+label(frontLayer, "\u{2199}", 470, 54, 34, 22, 16, LIGHT, CENTER, FONT_BOLD)
+
+-- glitching title
+local TITLE_X, TITLE_Y = 290, 68
+local ghostA = label(frontLayer, "FishGuy", TITLE_X, TITLE_Y, 220, 40, 28, CYAN, RIGHT, FONT_HEAD)
+local ghostB = label(frontLayer, "FishGuy", TITLE_X, TITLE_Y, 220, 40, 28, RED, RIGHT, FONT_HEAD)
+local title  = label(frontLayer, "FishGuy", TITLE_X, TITLE_Y, 220, 40, 28, LIGHT, RIGHT, FONT_HEAD)
+ghostA.TextTransparency = 1
+ghostB.TextTransparency = 1
+
+local function glitchSequence()
+	local base, chars = "FishGuy", "01#%$@&*<>/"
+	for _ = 1, rnd:NextInteger(5, 10) do
+		local out = {}
+		for c = 1, #base do
+			if rnd:NextNumber() < 0.35 then
+				local k = rnd:NextInteger(1, #chars)
+				out[c] = string.sub(chars, k, k)
+			else
+				out[c] = string.sub(base, c, c)
+			end
+		end
+		local s = table.concat(out)
+		title.Text, ghostA.Text, ghostB.Text = s, s, s
+		ghostA.TextTransparency, ghostB.TextTransparency = 0.35, 0.35
+		ghostA.Position = UDim2.fromOffset(TITLE_X + rnd:NextInteger(-6, 6), TITLE_Y + rnd:NextInteger(-2, 2))
+		ghostB.Position = UDim2.fromOffset(TITLE_X + rnd:NextInteger(-6, 6), TITLE_Y + rnd:NextInteger(-2, 2))
+		glitchOff = Vector2.new(rnd:NextInteger(-6, 6), rnd:NextInteger(-3, 3))
+		task.wait(0.045)
+	end
+	title.Text, ghostA.Text, ghostB.Text = base, base, base
+	ghostA.TextTransparency, ghostB.TextTransparency = 1, 1
+	glitchOff = Vector2.zero
+end
+
+task.spawn(function()
+	while gui.Parent do
+		task.wait(rnd:NextNumber(2, 5))
+		if CFG.glitch and inner.Visible then glitchSequence() end
+	end
+end)
+
+-- console
+box(frontLayer, 40, 496, 470, 14, DIM, 0.35)
+outline(frontLayer, 40, 496, 470, 84, MID)
+label(frontLayer, "SYS.LOG", 46, 497, 100, 12, 9, LIGHT, LEFT)
+local onlineTag = reg(label(frontLayer, "ONLINE", 420, 497, 84, 12, 9, GREEN, RIGHT), "TextColor3")
+local logLines = {}
+for k = 1, 4 do
+	logLines[k] = label(frontLayer, "", 48, 514 + (k - 1) * 16, 450, 14, 10, MID, LEFT)
+end
+table.insert(accentFns, function(c) logLines[#logLines].TextColor3 = c end)
+
+local MESSAGES = {
+	"> LINK ESTABLISHED  [OK]",
+	"> HANDSHAKE 0x4F2A9C  [OK]",
+	"> SYNC NODE FISHGUY",
+	"> UPLINK STABLE 98.4%",
+	"> CALIBRATING SENSORS...",
+	"> TARGET ACQUIRED",
+	"> PACKET LOSS 0.02%",
+	"> ENCRYPTION AES-256  [OK]",
+	"> SCANNING SECTOR 0-2",
+	"> POWER ROUTING NOMINAL",
+}
+task.spawn(function()
+	local idx = 1
+	while gui.Parent do
+		for k = 1, #logLines - 1 do
+			logLines[k].Text = logLines[k + 1].Text
+		end
+		for k, l in ipairs(logLines) do
+			l.TextColor3 = (k == #logLines) and ACC.color or DIM:Lerp(LIGHT, k / #logLines * 0.8)
+		end
+		local msg = table.remove(logQueue, 1)
+		local queued = msg ~= nil
+		if not msg then
+			msg = MESSAGES[idx]
+			idx = idx % #MESSAGES + 1
+		end
+		for c = 1, #msg do
+			logLines[#logLines].Text = string.sub(msg, 1, c) .. "_"
+			task.wait(0.015)
+		end
+		logLines[#logLines].Text = msg
+		if queued then
+			task.wait(0.2)
+		else
+			local waited = 0
+			while waited < 1.1 and #logQueue == 0 do
+				task.wait(0.05)
+				waited += 0.05
+			end
+		end
+	end
+end)
+
+-- bottom readout
+box(frontLayer, 40, 588, 28, 2, MID)
+local progLabel = label(frontLayer, "01/06", 40, 594, 130, 20, 16, WHITE, LEFT, FONT_HEAD)
+outline(frontLayer, 40, 620, 190, 8, MID)
+local progFill = box(frontLayer, 41, 621, 0, 6, LIGHT)
+for k = 1, 5 do
+	box(frontLayer, 40 + 190 * k / 6, 620, 1, 8, BG)
+end
+local clockLabel = label(frontLayer, "", 330, 594, 180, 12, 10, MID, RIGHT)
+local tickSquares = {}
+for i = 0, 8 do
+	tickSquares[i + 1] = box(frontLayer, 260 + i * 14, 622, 7, 7, MID)
+end
+
+----------------------------------------------------------------
+-- GAUGES (sides)
+----------------------------------------------------------------
+local gauges = {}
+local function makeGauge(x, tag, phase)
+	local segs = {}
+	for s = 0, 15 do
+		segs[s + 1] = box(gaugeLayer, x, 130 + s * 21, 10, 17, DIM, 0.4)
+	end
+	label(gaugeLayer, tag, x - 10, 110, 30, 12, 10, MID, CENTER)
+	local pct = label(gaugeLayer, "", x - 10, 470, 30, 12, 9, LIGHT, CENTER)
+	local g = { segs = segs, pct = pct, phase = phase, last = -1 }
+	table.insert(gauges, g)
+end
+makeGauge(18, "HP", 0)
+makeGauge(WIN_W - 28, "PWR", 2.2)
+table.insert(accentFns, function() for _, g in ipairs(gauges) do g.last = -1 end end)
+local blinkL = reg(box(gaugeLayer, 34, 130, 4, 24, GREEN))
+local blinkR = box(gaugeLayer, WIN_W - 38, 130, 4, 24, WHITE)
+
+----------------------------------------------------------------
+-- BUTTON component
+----------------------------------------------------------------
+local function newButton(parent, o)
+	local obj = { on = o.on or false, hover = false, kind = o.kind or "action" }
+	local w, h = o.w, o.h
+
+	local b = Instance.new("TextButton")
+	b.AutoButtonColor = false
+	b.Text = ""
+	b.BackgroundColor3 = BTN_BG
+	b.BorderSizePixel = 0
+	b.Position = UDim2.fromOffset(o.x, o.y)
+	b.Size = UDim2.fromOffset(w, h)
+	b.ClipsDescendants = true
+	b.Parent = parent
+
+	local stroke = Instance.new("UIStroke")
+	stroke.Color = MID
+	stroke.Thickness = 1
+	stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+	stroke.Parent = b
+	local sc = Instance.new("UIScale")
+	sc.Parent = b
+
+	local fill = box(b, 0, 0, 0, h, WHITE, 0.9)
+	local bar = box(b, 0, 0, 3, h, MID)
+	local txt = label(b, o.text, 14, 0, w - 38, h, 12, LIGHT, LEFT, FONT_SMALL)
+	txt.TextTruncate = Enum.TextTruncate.AtEnd
+	local ind = box(b, w - 20, h / 2 - 4, 8, 8, DIM)
+	local st
+	if obj.kind == "toggle" then
+		st = label(b, "OFF", w - 66, 0, 40, h, 9, MID, RIGHT)
+	end
+
+	local function paint(skipStroke)
+		local hot = obj.on or obj.hover
+		local c = hot and ACC.color or MID
+		if not skipStroke then
+			stroke.Color = c
+			bar.BackgroundColor3 = c
+		end
+		if obj.kind == "swatch" then
+			ind.BackgroundColor3 = o.color
+		elseif obj.kind == "action" then
+			ind.BackgroundColor3 = obj.hover and ACC.color or DIM
+		else
+			ind.BackgroundColor3 = obj.on and ACC.color or DIM
+		end
+		if st then
+			st.Text = obj.on and "ON" or "OFF"
+			st.TextColor3 = obj.on and ACC.color or MID
+		end
+	end
+	table.insert(accentFns, function() paint() end)
+	paint()
+
+	function obj.setOn(v)
+		obj.on = v
+		paint()
+	end
+
+	b.MouseEnter:Connect(function()
+		obj.hover = true
+		hovered[obj] = true
+		tween(fill, 0.3, { Size = UDim2.fromOffset(w, h) })
+		tween(stroke, 0.15, { Color = ACC.color })
+		tween(bar, 0.2, { Size = UDim2.fromOffset(6, h), BackgroundColor3 = ACC.color })
+		tween(txt, 0.2, { Position = UDim2.fromOffset(20, 0) })
+		paint(true)
+		scramble(txt, o.text, 0.18)
+	end)
+
+	local function unhover()
+		obj.hover = false
+		hovered[obj] = nil
+		tween(fill, 0.25, { Size = UDim2.fromOffset(0, h) })
+		tween(bar, 0.2, { Size = UDim2.fromOffset(3, h), BackgroundColor3 = obj.on and ACC.color or MID })
+		tween(stroke, 0.2, { Color = obj.on and ACC.color or MID })
+		tween(txt, 0.2, { Position = UDim2.fromOffset(14, 0) })
+		tween(sc, 0.15, { Scale = 1 })
+		paint(true)
+	end
+	b.MouseLeave:Connect(unhover)
+
+	b.MouseButton1Down:Connect(function()
+		tween(sc, 0.08, { Scale = 0.95 })
+	end)
+	b.MouseButton1Up:Connect(function()
+		tween(sc, 0.3, { Scale = 1 }, Enum.EasingStyle.Back)
+	end)
+
+	b.Activated:Connect(function()
+		local fl = box(b, 0, 0, w, h, WHITE, 0.55)
+		tween(fl, 0.35, { BackgroundTransparency = 1 })
+		task.delay(0.36, function() fl:Destroy() end)
+
+		local p = UserInputService:GetMouseLocation() - b.AbsolutePosition
+		local r, s = circle(b, p.X, p.Y, 2, ACC.color, 2, 0.1)
+		tween(r, 0.5, { Size = UDim2.fromOffset(w * 1.6, w * 1.6) })
+		tween(s, 0.5, { Transparency = 1 })
+		task.delay(0.55, function() r:Destroy() end)
+
+		scramble(txt, o.text, 0.25)
+		if o.onClick then o.onClick(obj) end
+	end)
+
+	obj.frame = b
+	obj.base = Vector2.new(o.x, o.y)
+	obj.unhover = unhover
+	return obj
+end
+
+----------------------------------------------------------------
+-- PAGES
+----------------------------------------------------------------
+local pageOrder = { "HOME", "FEATURES", "TROLLING", "THEME", "SYSTEM" }
+local pages = {}
+
+local function newPageGroup()
+	local g = Instance.new("CanvasGroup")
+	g.BackgroundTransparency = 1
+	g.BorderSizePixel = 0
+	g.Size = UDim2.fromOffset(WIN_W, WIN_H)
+	g.Visible = false
+	g.Parent = midLayer
+	return g
+end
+
+------------------------------------------------ HOME (updates panel)
+local homeGroup = newPageGroup()
+pages[1] = { group = homeGroup, buttons = {} }
+
+local UP_X, UP_Y, UP_W, UP_H = 44, 150, 462, 330
+
+-- corner boxes to match the rest of the HUD's frame language
+for _, p in ipairs({ { UP_X - 2, UP_Y - 2 }, { UP_X + UP_W - 18, UP_Y - 2 }, { UP_X - 2, UP_Y + UP_H - 18 }, { UP_X + UP_W - 18, UP_Y + UP_H - 18 } }) do
+	outline(homeGroup, p[1], p[2], 20, 20, DIM)
+end
+
+outline(homeGroup, UP_X, UP_Y, UP_W, UP_H, MID)
+box(homeGroup, UP_X, UP_Y, UP_W, 26, DIM, 0.35)
+reg(box(homeGroup, UP_X, UP_Y, 5, 26, GREEN))
+label(homeGroup, "UPDATES:", UP_X + 16, UP_Y, 200, 26, 14, WHITE, LEFT, FONT_HEAD)
+local updateStamp = label(homeGroup, "", UP_X + UP_W - 150, UP_Y, 134, 26, 9, MID, RIGHT)
+
+-- background crosshair grid behind the text, matching the rest of the HUD
+for i = 0, 6 do
+	for j = 0, 5 do
+		label(homeGroup, "+", UP_X + 20 + i * 70 - 6, UP_Y + 46 + j * 46 - 7, 12, 14, 11, Color3.fromRGB(46, 50, 55), CENTER)
+	end
+end
+
+local updateBody = box(homeGroup, UP_X + 14, UP_Y + 40, UP_W - 28, UP_H - 54, BG, 1)
+local updateLbl = label(updateBody, "", 4, 4, UP_W - 40, UP_H - 60, 13, LIGHT, LEFT)
+updateLbl.TextYAlignment = Enum.TextYAlignment.Top
+updateLbl.TextWrapped = true
+local caret = box(updateBody, 4, 4, 8, 15, GREEN)
+reg(caret)
+
+-- blinking rec dot + version footer
+local recDot = reg(box(homeGroup, UP_X + 16, UP_Y + UP_H - 22, 6, 6, GREEN))
+label(homeGroup, "LOG", UP_X + 28, UP_Y + UP_H - 26, 60, 14, 9, MID, LEFT)
+local verLabel = label(homeGroup, "BUILD 1.0.0", UP_X + UP_W - 110, UP_Y + UP_H - 26, 96, 14, 9, MID, RIGHT)
+
+local UPDATES = {
+	{ tag = "v1.0.0", text = "Script released." },
+}
+
+local function typeUpdates()
+	updateLbl.Text = ""
+	caret.Visible = true
+	local full = {}
+	for i, u in ipairs(UPDATES) do
+		full[i] = string.format("[%s]  %s", u.tag, u.text)
+	end
+	local shown = ""
+	for i, line in ipairs(full) do
+		for c = 1, #line do
+			shown = shown .. string.sub(line, c, c)
+			updateLbl.Text = shown
+			caret.Position = UDim2.fromOffset(4 + updateLbl.TextBounds.X % (UP_W - 40), 4 + math.floor((c) / 1) * 0)
+			task.wait(0.018)
+		end
+		shown = shown .. "\n"
+		updateLbl.Text = shown
+		if i < #full then task.wait(0.25) end
+	end
+	caret.Visible = false
+	log("UPDATES LOADED")
+end
+task.spawn(function()
+	task.wait(0.6)
+	updateStamp.Text = os.date("%m/%d/%Y")
+	typeUpdates()
+end)
+
+------------------------------------------------ generic page builder
+local function buildPage(idx, titleText, sections, infoFn, opts)
+	opts = opts or {}
+	local g = newPageGroup()
+	local page = { group = g, buttons = {} }
+	pages[idx] = page
+
+	label(g, titleText, 44, 108, 420, 20, 13, WHITE, LEFT, FONT_HEAD)
+	box(g, 44, 132, 462, 1, DIM, 0.3)
+	reg(box(g, 44, 131, 70, 3, GREEN))
+
+	local container = g
+	local scrollFrame
+	local baseX, baseY = 44, 144
+
+	if opts.scroll then
+		local scrollH = 254
+		outline(g, 44, 144, 462, scrollH, DIM)
+		box(g, 44, 144, 462, 14, DIM, 0.4)
+		label(g, "// SCROLL FOR MORE", 50, 145, 160, 12, 9, MID, LEFT)
+
+		scrollFrame = Instance.new("ScrollingFrame")
+		scrollFrame.BackgroundTransparency = 1
+		scrollFrame.BorderSizePixel = 0
+		scrollFrame.Position = UDim2.fromOffset(45, 158)
+		scrollFrame.Size = UDim2.fromOffset(460, scrollH - 14)
+		scrollFrame.CanvasSize = UDim2.fromOffset(0, 0)
+		scrollFrame.ScrollBarThickness = 4
+		scrollFrame.ScrollBarImageColor3 = MID
+		scrollFrame.ScrollingDirection = Enum.ScrollingDirection.Y
+		scrollFrame.ClipsDescendants = true
+		scrollFrame.Parent = g
+		container = scrollFrame
+		baseX, baseY = 6, 8
+	end
+
+	local groups = {}
+	local y = baseY
+	local BH, PITCH = 34, 40
+	for _, sec in ipairs(sections) do
+		label(container, "// " .. sec.title, baseX, y, 300, 12, 9, MID, LEFT)
+		y += 18
+		local cols = sec.cols or 2
+		local areaW = (opts.scroll and 436 or 462)
+		local bw = (areaW - (cols - 1) * 10) / cols
+		for n, it in ipairs(sec.items) do
+			local col = (n - 1) % cols
+			local row = math.floor((n - 1) / cols)
+			local ob
+			ob = newButton(container, {
+				text = it.text, kind = it.kind or "action", on = it.on, color = it.color,
+				x = baseX + col * (bw + 10), y = y + row * PITCH, w = bw, h = BH,
+				onClick = function(self)
+					if it.group then
+						for _, other in ipairs(groups[it.group]) do
+							other.setOn(other == self)
+						end
+					elseif it.kind == "toggle" then
+						self.setOn(not self.on)
+					end
+					if it.cb then it.cb(self.on) end
+				end,
+			})
+			if it.group then
+				groups[it.group] = groups[it.group] or {}
+				table.insert(groups[it.group], ob)
+			end
+			table.insert(page.buttons, ob)
+		end
+		y += math.ceil(#sec.items / cols) * PITCH + 4
+	end
+
+	if opts.scroll then
+		scrollFrame.CanvasSize = UDim2.fromOffset(0, y + 8)
+	end
+
+	if infoFn then
+		outline(g, 44, 398, 462, 86, DIM)
+		box(g, 44, 398, 462, 14, DIM, 0.4)
+		label(g, "// LIVE DATA", 50, 399, 150, 12, 9, LIGHT, LEFT)
+		local infoLbl = label(g, "", 52, 416, 446, 66, 11, LIGHT, LEFT)
+		infoLbl.TextYAlignment = Enum.TextYAlignment.Top
+		page.info = function() infoLbl.Text = infoFn() end
+	end
+	return page
+end
+
+------------------------------------------------ PLAYER page
+local pstate = { speed = 16, jump = 50, touched = false }
+local function humanoid()
+	local c = player.Character
+	return c and c:FindFirstChildOfClass("Humanoid")
+end
+local function applyPlayer()
+	local h = humanoid()
+	if not h then return end
+	h.WalkSpeed = pstate.speed
+	h.UseJumpPower = true
+	h.JumpPower = pstate.jump
+end
+player.CharacterAdded:Connect(function(c)
+	c:WaitForChild("Humanoid")
+	task.wait(0.2)
+	if pstate.touched then applyPlayer() end
+end)
+local function setSpeed(v)
+	pstate.speed, pstate.touched = v, true
+	applyPlayer()
+	log("WALKSPEED " .. v)
+end
+local function setJump(v)
+	pstate.jump, pstate.touched = v, true
+	applyPlayer()
+	log("JUMPPOWER " .. v)
+end
+
+--============================================================
+-- FEATURES TAB — edit the "items" lists below to add your own buttons.
+--
+-- Each button looks like this:
+--   { text = "BUTTON NAME", cb = function() -- what happens on click
+--       print("hello")
+--   end },
+--
+-- Want an ON/OFF button instead of a one-click button?
+--   { text = "BUTTON NAME", kind = "toggle", cb = function(on)
+--       if on then -- turned on
+--       else       -- turned off
+--       end
+--   end },
+--
+-- Want a group where only one can be picked at a time (like a radio)?
+--   Give every button in the group the same "group" name:
+--   { text = "OPTION A", kind = "radio", group = "mygroup", cb = function() end },
+--   { text = "OPTION B", kind = "radio", group = "mygroup", cb = function() end },
+--
+-- "cols" controls how many buttons sit side by side in that section.
+-- Add a whole new row of buttons by adding another { title=..., items={...} } section.
+--============================================================
+buildPage(2, "FEATURES // CONTROL", {
+	{ title = "SECTION 1", cols = 1, items = {
+		{ text = "SLOT 01 — EMPTY", kind = "toggle", cb = function(on) log("SLOT 01: " .. (on and "ON" or "OFF")) end },
+		{ text = "SLOT 02 — EMPTY", kind = "toggle", cb = function(on) log("SLOT 02: " .. (on and "ON" or "OFF")) end },
+		{ text = "SLOT 03 — EMPTY", kind = "toggle", cb = function(on) log("SLOT 03: " .. (on and "ON" or "OFF")) end },
+		{ text = "SLOT 04 — EMPTY", kind = "toggle", cb = function(on) log("SLOT 04: " .. (on and "ON" or "OFF")) end },
+		{ text = "SLOT 05 — EMPTY", kind = "toggle", cb = function(on) log("SLOT 05: " .. (on and "ON" or "OFF")) end },
+	} },
+	{ title = "SECTION 2", cols = 1, items = {
+		{ text = "SLOT 06 — EMPTY", kind = "toggle", cb = function(on) log("SLOT 06: " .. (on and "ON" or "OFF")) end },
+		{ text = "SLOT 07 — EMPTY", kind = "toggle", cb = function(on) log("SLOT 07: " .. (on and "ON" or "OFF")) end },
+		{ text = "SLOT 08 — EMPTY", kind = "toggle", cb = function(on) log("SLOT 08: " .. (on and "ON" or "OFF")) end },
+		{ text = "SLOT 09 — EMPTY", kind = "toggle", cb = function(on) log("SLOT 09: " .. (on and "ON" or "OFF")) end },
+		{ text = "SLOT 10 — EMPTY", kind = "toggle", cb = function(on) log("SLOT 10: " .. (on and "ON" or "OFF")) end },
+	} },
+	{ title = "SECTION 3", cols = 1, items = {
+		{ text = "SLOT 11 — EMPTY", kind = "toggle", cb = function(on) log("SLOT 11: " .. (on and "ON" or "OFF")) end },
+		{ text = "SLOT 12 — EMPTY", kind = "toggle", cb = function(on) log("SLOT 12: " .. (on and "ON" or "OFF")) end },
+		{ text = "SLOT 13 — EMPTY", kind = "toggle", cb = function(on) log("SLOT 13: " .. (on and "ON" or "OFF")) end },
+		{ text = "SLOT 14 — EMPTY", kind = "toggle", cb = function(on) log("SLOT 14: " .. (on and "ON" or "OFF")) end },
+		{ text = "SLOT 15 — EMPTY", kind = "toggle", cb = function(on) log("SLOT 15: " .. (on and "ON" or "OFF")) end },
+	} },
+}, function()
+	local h = humanoid()
+	if not h then return "NO CHARACTER" end
+	local hrp = h.RootPart
+	local p = hrp and hrp.Position or Vector3.zero
+	return string.format("WALKSPEED  %d\nJUMPPOWER  %d\nHEALTH     %d / %d\nPOSITION   %d, %d, %d",
+		math.floor(h.WalkSpeed), math.floor(h.JumpPower), math.floor(h.Health), math.floor(h.MaxHealth),
+		math.floor(p.X), math.floor(p.Y), math.floor(p.Z))
+end, { scroll = true })
+
+------------------------------------------------ WORLD page
+local origLight = {
+	Brightness = Lighting.Brightness,
+	Ambient = Lighting.Ambient,
+	OutdoorAmbient = Lighting.OutdoorAmbient,
+	FogEnd = Lighting.FogEnd,
+}
+local function setTime(v, name)
+	tween(Lighting, 1.5, { ClockTime = v }, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut)
+	log("TIME -> " .. name)
+end
+local function setFov(v)
+	local cam = workspace.CurrentCamera
+	if cam then tween(cam, 0.5, { FieldOfView = v }, Enum.EasingStyle.Quint) end
+	log("FOV " .. v)
+end
+
+--============================================================
+-- TROLLING TAB — edit the "items" lists below to add your own buttons.
+-- Same format as the FEATURES tab above:
+--   { text = "BUTTON NAME", cb = function() -- runs on click
+--   end },
+--   { text = "BUTTON NAME", kind = "toggle", cb = function(on) -- on/off
+--   end },
+--   { text = "OPTION A", kind = "radio", group = "mygroup", cb = function() end }, -- pick-one group
+--============================================================
+buildPage(3, "TROLLING // TOOLS", {
+	{ title = "SECTION 1", cols = 1, items = {
+		{ text = "SLOT 01 — EMPTY", kind = "toggle", cb = function(on) log("SLOT 01: " .. (on and "ON" or "OFF")) end },
+		{ text = "SLOT 02 — EMPTY", kind = "toggle", cb = function(on) log("SLOT 02: " .. (on and "ON" or "OFF")) end },
+		{ text = "SLOT 03 — EMPTY", kind = "toggle", cb = function(on) log("SLOT 03: " .. (on and "ON" or "OFF")) end },
+		{ text = "SLOT 04 — EMPTY", kind = "toggle", cb = function(on) log("SLOT 04: " .. (on and "ON" or "OFF")) end },
+		{ text = "SLOT 05 — EMPTY", kind = "toggle", cb = function(on) log("SLOT 05: " .. (on and "ON" or "OFF")) end },
+	} },
+	{ title = "SECTION 2", cols = 1, items = {
+		{ text = "SLOT 06 — EMPTY", kind = "toggle", cb = function(on) log("SLOT 06: " .. (on and "ON" or "OFF")) end },
+		{ text = "SLOT 07 — EMPTY", kind = "toggle", cb = function(on) log("SLOT 07: " .. (on and "ON" or "OFF")) end },
+		{ text = "SLOT 08 — EMPTY", kind = "toggle", cb = function(on) log("SLOT 08: " .. (on and "ON" or "OFF")) end },
+		{ text = "SLOT 09 — EMPTY", kind = "toggle", cb = function(on) log("SLOT 09: " .. (on and "ON" or "OFF")) end },
+		{ text = "SLOT 10 — EMPTY", kind = "toggle", cb = function(on) log("SLOT 10: " .. (on and "ON" or "OFF")) end },
+	} },
+	{ title = "SECTION 3", cols = 1, items = {
+		{ text = "SLOT 11 — EMPTY", kind = "toggle", cb = function(on) log("SLOT 11: " .. (on and "ON" or "OFF")) end },
+		{ text = "SLOT 12 — EMPTY", kind = "toggle", cb = function(on) log("SLOT 12: " .. (on and "ON" or "OFF")) end },
+		{ text = "SLOT 13 — EMPTY", kind = "toggle", cb = function(on) log("SLOT 13: " .. (on and "ON" or "OFF")) end },
+		{ text = "SLOT 14 — EMPTY", kind = "toggle", cb = function(on) log("SLOT 14: " .. (on and "ON" or "OFF")) end },
+		{ text = "SLOT 15 — EMPTY", kind = "toggle", cb = function(on) log("SLOT 15: " .. (on and "ON" or "OFF")) end },
+	} },
+}, function()
+	local cam = workspace.CurrentCamera
+	return string.format("CLOCK TIME  %05.2f\nFOV         %d\nBRIGHTNESS  %.1f",
+		Lighting.ClockTime, cam and math.floor(cam.FieldOfView) or 0, Lighting.Brightness)
+end, { scroll = true })
+
+------------------------------------------------ THEME page
+local scanLines, vignetteHolder -- created with the overlay below
+local function accentItem(name, color, on)
+	return { text = name, kind = "swatch", group = "acc", color = color, on = on, cb = function()
+		ACC.name = name
+		setAccent(color)
+		log("ACCENT -> " .. name)
+	end }
+end
+
+buildPage(4, "THEME // STYLE", {
+	{ title = "ACCENT COLOR", cols = 3, items = {
+		accentItem("EMERALD", GREEN, true),
+		accentItem("CYAN", Color3.fromRGB(60, 240, 255)),
+		accentItem("VIOLET", Color3.fromRGB(170, 110, 255)),
+		accentItem("AMBER", Color3.fromRGB(255, 184, 40)),
+		accentItem("CRIMSON", Color3.fromRGB(255, 70, 110)),
+		accentItem("ICE", Color3.fromRGB(225, 240, 255)),
+	} },
+	{ title = "DISPLAY", cols = 2, items = {
+		{ text = "SCANLINES", kind = "toggle", on = true, cb = function(on)
+			if scanLines then scanLines.Visible = on end
+			log("SCANLINES " .. (on and "ON" or "OFF"))
+		end },
+		{ text = "VIGNETTE", kind = "toggle", on = true, cb = function(on)
+			if vignetteHolder then vignetteHolder.Visible = on end
+			log("VIGNETTE " .. (on and "ON" or "OFF"))
+		end },
+	} },
+}, function()
+	local c = ACC.color
+	return string.format("ACCENT     %s\nRGB        %d, %d, %d\nHEX        #%02X%02X%02X",
+		ACC.name, math.floor(c.R * 255 + 0.5), math.floor(c.G * 255 + 0.5), math.floor(c.B * 255 + 0.5),
+		math.floor(c.R * 255 + 0.5), math.floor(c.G * 255 + 0.5), math.floor(c.B * 255 + 0.5))
+end)
+
+------------------------------------------------ SYSTEM page
+local TeleportService = game:GetService("TeleportService")
+
+local function rejoin()
+	log("REJOINING SERVER...")
+	local ok, err = pcall(function()
+		TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId, player)
+	end)
+	if not ok then
+		log("REJOIN FAILED, RETRYING...")
+		TeleportService:Teleport(game.PlaceId, player)
+	end
+end
+
+local function serverHop()
+	log("SERVER HOPPING...")
+	local ok, err = pcall(function()
+		TeleportService:Teleport(game.PlaceId, player)
+	end)
+	if not ok then
+		log("SERVER HOP FAILED")
+	end
+end
+
+buildPage(5, "SYSTEM // CONFIG", {
+	{ title = "EFFECTS", cols = 2, items = {
+		{ text = "PARALLAX", kind = "toggle", on = true, cb = function(on) CFG.parallax = on; log("PARALLAX " .. (on and "ON" or "OFF")) end },
+		{ text = "RETICLE", kind = "toggle", on = true, cb = function(on) CFG.reticle = on; log("RETICLE " .. (on and "ON" or "OFF")) end },
+		{ text = "GLITCH FX", kind = "toggle", on = true, cb = function(on) CFG.glitch = on; log("GLITCH FX " .. (on and "ON" or "OFF")) end },
+		{ text = "CLICK KICK", kind = "toggle", on = true, cb = function(on) CFG.kick = on; log("CLICK KICK " .. (on and "ON" or "OFF")) end },
+	} },
+	{ title = "PARALLAX STRENGTH", cols = 3, items = {
+		{ text = "LOW", kind = "radio", group = "par", cb = function() CFG.parMul = 0.5; log("PARALLAX LOW") end },
+		{ text = "MEDIUM", kind = "radio", group = "par", on = true, cb = function() CFG.parMul = 1; log("PARALLAX MEDIUM") end },
+		{ text = "HIGH", kind = "radio", group = "par", cb = function() CFG.parMul = 1.8; log("PARALLAX HIGH") end },
+	} },
+	{ title = "SERVER", cols = 2, items = {
+		{ text = "REJOIN", cb = function() rejoin() end },
+		{ text = "SERVER HOP", cb = function() serverHop() end },
+	} },
+	{ title = "POWER  (H REOPENS)", cols = 2, items = {
+		{ text = "CLOSE HUD", cb = function()
+			if not busy then task.spawn(closeWindow) end
+		end },
+		{ text = "REBOOT HUD", cb = function()
+			if busy then return end
+			task.spawn(function()
+				closeWindow()
+				task.wait(0.3)
+				openWindow()
+			end)
+		end },
+	} },
+}, function()
+	local ping = getPing()
+	return string.format("FPS      %d\nPING     %s\nPLAYERS  %d\nUPTIME   %d s",
+		fpsValue, ping and (ping .. " ms") or "N/A", #Players:GetPlayers(), math.floor(t))
+end, { scroll = true })
+
+-- accent line that sweeps down the page area when switching tabs
+local pageWipe = reg(box(midLayer, 44, 110, 462, 2, GREEN, 1))
+
+----------------------------------------------------------------
+-- OVERLAY: scanlines, vignette, sweeping bar
+----------------------------------------------------------------
+local scan = Instance.new("Frame")
+scan.Name = "Scan"
+scan.BackgroundTransparency = 1
+scan.Size = UDim2.fromScale(1, 1)
+scan.ZIndex = 10
+scan.Parent = inner
+
+scanLines = box(scan, 0, 0, WIN_W, WIN_H, BG, 1)
+for y = 0, WIN_H, 5 do
+	box(scanLines, 0, y, WIN_W, 1, Color3.new(0, 0, 0), 0.93)
+end
+
+vignetteHolder = box(scan, 0, 0, WIN_W, WIN_H, BG, 1)
+local function vignette(x, y, w, h, rot)
+	local f = box(vignetteHolder, x, y, w, h, Color3.new(0, 0, 0), 0)
+	local g = Instance.new("UIGradient")
+	g.Rotation = rot
+	g.Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0.3), NumberSequenceKeypoint.new(1, 1) })
+	g.Parent = f
+end
+vignette(0, 0, WIN_W, 90, 90)
+vignette(0, WIN_H - 90, WIN_W, 90, 270)
+vignette(0, 0, 80, WIN_H, 0)
+vignette(WIN_W - 80, 0, 80, WIN_H, 180)
+
+local sweepBar = reg(box(scan, 0, -70, WIN_W, 70, GREEN, 0))
+do
+	local g = Instance.new("UIGradient")
+	g.Rotation = 90
+	g.Transparency = NumberSequence.new({
+		NumberSequenceKeypoint.new(0, 1),
+		NumberSequenceKeypoint.new(0.5, 0.88),
+		NumberSequenceKeypoint.new(1, 1),
+	})
+	g.Parent = sweepBar
+	reg(box(sweepBar, 0, 34, WIN_W, 1, GREEN, 0.6))
+end
+
+----------------------------------------------------------------
+-- CHROME: frame, drag bar, tab bar
+----------------------------------------------------------------
+local chrome = Instance.new("Frame")
+chrome.Name = "Chrome"
+chrome.BackgroundTransparency = 1
+chrome.Size = UDim2.fromScale(1, 1)
+chrome.ZIndex = 20
+chrome.Parent = inner
+
+local _, panelStroke = outline(chrome, 6, 26, WIN_W - 12, WIN_H - 36, DIM, 1)
+box(chrome, 0, 26, 6, WIN_H - 36, LIGHT)
+box(chrome, WIN_W - 6, 26, 6, WIN_H - 36, LIGHT)
+box(chrome, 0, WIN_H - 10, WIN_W, 10, LIGHT)
+local d1 = box(chrome, WIN_W - 14, 12, 28, 28, LIGHT); d1.Rotation = 45
+local d2 = box(chrome, -14, WIN_H - 24, 28, 28, LIGHT); d2.Rotation = 45
+
+local topBar = box(window, 0, 0, WIN_W, 26, LIGHT)
+topBar.Active = true
+topBar.Name = "DragBar"
+topBar.ZIndex = 5
+local dot = box(topBar, 12, 9, 8, 8, BG)
+do local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(1, 0); c.Parent = dot end
+label(topBar, "MM2", 28, 6, 220, 14, 11, DARKTXT, LEFT)
+local barDash = reg(box(topBar, 250, 12, 22, 3, GREEN))
+box(topBar, 280, 12, 22, 3, MID)
+box(topBar, 310, 12, 22, 3, DARKTXT)
+local fpsLabel = label(topBar, "FPS 060", 380, 6, 80, 14, 10, DARKTXT, RIGHT)
+box(topBar, 466, 12, 14, 3, MID)
+reg(box(topBar, 484, 12, 20, 3, GREEN))
+
+----------------------------------------------------------------
+-- Minimize button (top-right circle) -> shrinks the whole window
+-- into a small draggable circular bubble
+----------------------------------------------------------------
+local minBtn = Instance.new("TextButton")
+minBtn.AutoButtonColor = false
+minBtn.Text = ""
+minBtn.BackgroundColor3 = BG
+minBtn.BorderSizePixel = 0
+minBtn.AnchorPoint = Vector2.new(0.5, 0.5)
+minBtn.Position = UDim2.fromOffset(WIN_W - 17, 13)
+minBtn.Size = UDim2.fromOffset(16, 16)
+minBtn.ZIndex = 6
+minBtn.Parent = topBar
+do local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(1, 0); c.Parent = minBtn end
+local minStroke = Instance.new("UIStroke")
+minStroke.Color = MID
+minStroke.Thickness = 1
+minStroke.Parent = minBtn
+local minGlyph = label(minBtn, "-", 0, -1, 16, 16, 14, LIGHT, CENTER, FONT_BOLD)
+minGlyph.ZIndex = 7
+
+minBtn.MouseEnter:Connect(function()
+	tween(minStroke, 0.15, { Color = ACC.color })
+	tween(minGlyph, 0.15, { TextColor3 = ACC.color })
+end)
+minBtn.MouseLeave:Connect(function()
+	tween(minStroke, 0.15, { Color = MID })
+	tween(minGlyph, 0.15, { TextColor3 = LIGHT })
+end)
+
+local function clampToScreen(c, halfW, halfH)
+	local vp = gui.AbsoluteSize
+	return Vector2.new(
+		math.max(halfW, math.min(vp.X - halfW, c.X)),
+		math.max(halfH, math.min(vp.Y - halfH, c.Y))
+	)
+end
+
+-- the bubble itself
+local BUB = 56
+local bubble = Instance.new("TextButton")
+bubble.Name = "Bubble"
+bubble.AutoButtonColor = false
+bubble.Text = ""
+bubble.AnchorPoint = Vector2.new(0.5, 0.5)
+bubble.Position = UDim2.fromScale(0.5, 0.5)
+bubble.Size = UDim2.fromOffset(0, 0)
+bubble.BackgroundColor3 = BG
+bubble.BorderSizePixel = 0
+bubble.Visible = false
+bubble.ZIndex = 15
+bubble.Active = true
+bubble.Parent = gui
+do local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(1, 0); c.Parent = bubble end
+local bubbleStroke = Instance.new("UIStroke")
+bubbleStroke.Thickness = 2
+bubbleStroke.Parent = bubble
+reg(bubbleStroke, "Color")
+
+local bubbleRingFrame, bubbleRingStroke = circle(bubble, BUB / 2, BUB / 2, BUB / 2 - 6, MID, 1, 0.5)
+local bubbleGlyph = label(bubble, "FG", 0, 0, BUB, BUB, 16, LIGHT, CENTER, FONT_HEAD)
+local bubbleDot = reg(box(bubble, BUB - 14, 4, 8, 8, GREEN))
+do local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(1, 0); c.Parent = bubbleDot end
+
+local setMinimized -- forward declaration; defined below, used by the handlers above
+
+-- bubble dragging (also handles single-click to restore)
+-- Mouse uses the same per-frame polling as the main window drag (see the
+-- RenderStepped loop below) so it can't desync/glitch; touch uses delta-based
+-- movement since touch input doesn't support GetMouseLocation-style polling.
+local bubbleDragging, bubbleIsTouch, bubbleMoved = false, false, false
+local bubbleDragOffset = Vector2.zero
+local bubbleMouseStart = Vector2.zero
+local bubbleTouchStart, bubbleTouchStartCenter
+
+bubble.InputBegan:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1 then
+		bubbleDragging, bubbleIsTouch, bubbleMoved = true, false, false
+		local mouse = UserInputService:GetMouseLocation()
+		bubbleMouseStart = mouse
+		bubbleDragOffset = (bubble.AbsolutePosition + bubble.AbsoluteSize / 2) - mouse
+		tween(bubble, 0.12, { Size = UDim2.fromOffset(BUB * 0.9, BUB * 0.9) })
+	elseif input.UserInputType == Enum.UserInputType.Touch then
+		bubbleDragging, bubbleIsTouch, bubbleMoved = true, true, false
+		bubbleTouchStart = input.Position
+		bubbleTouchStartCenter = Vector2.new(bubble.Position.X.Offset, bubble.Position.Y.Offset)
+		tween(bubble, 0.12, { Size = UDim2.fromOffset(BUB * 0.9, BUB * 0.9) })
+		input.Changed:Connect(function()
+			if input.UserInputState == Enum.UserInputState.End then
+				bubbleDragging = false
+			end
+		end)
+	end
+end)
+
+UserInputService.InputChanged:Connect(function(input)
+	if bubbleDragging and bubbleIsTouch and input.UserInputType == Enum.UserInputType.Touch then
+		local d = input.Position - bubbleTouchStart
+		local c = clampToScreen(bubbleTouchStartCenter + Vector2.new(d.X, d.Y), BUB / 2, BUB / 2)
+		bubble.Position = UDim2.fromOffset(c.X, c.Y)
+		if d.Magnitude > 4 then bubbleMoved = true end
+	end
+end)
+
+UserInputService.InputEnded:Connect(function(input)
+	if bubbleDragging and (input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch) then
+		bubbleDragging = false
+		tween(bubble, 0.2, { Size = UDim2.fromOffset(BUB, BUB) }, Enum.EasingStyle.Back)
+		if not bubbleMoved then
+			task.spawn(setMinimized, false)
+		end
+	end
+end)
+
+function setMinimized(v)
+	if busy or minimized == v then return end
+	minimized = v
+	busy = true
+	if v then
+		local center = window.AbsolutePosition + window.AbsoluteSize / 2
+		bubble.Position = UDim2.fromOffset(center.X, center.Y)
+		bubble.Size = UDim2.fromOffset(0, 0)
+		bubble.Visible = true
+		window.Visible = false
+		inner.Visible = false
+		tween(bubble, 0.28, { Size = UDim2.fromOffset(BUB, BUB) }, Enum.EasingStyle.Back)
+	else
+		local bx, by = bubble.Position.X.Offset, bubble.Position.Y.Offset
+		local c = clampToScreen(Vector2.new(bx, by), WIN_W / 2, WIN_H / 2)
+		window.Position = UDim2.fromOffset(c.X, c.Y)
+		window.Size = UDim2.fromOffset(BUB, BUB)
+		window.Visible = true
+		inner.Visible = true
+		local tw = tween(bubble, 0.18, { Size = UDim2.fromOffset(0, 0) }, Enum.EasingStyle.Quint, Enum.EasingDirection.In)
+		tween(window, 0.3, { Size = UDim2.fromOffset(WIN_W, WIN_H) }, Enum.EasingStyle.Back)
+		tw.Completed:Wait()
+		bubble.Visible = false
+	end
+	busy = false
+end
+
+minBtn.Activated:Connect(function()
+	if not ready then return end
+	task.spawn(setMinimized, true)
+end)
+
+label(chrome, "\u{25C0}", 8, WIN_H / 2 - 12, 20, 24, 14, WHITE, CENTER, FONT_BOLD)
+label(chrome, "\u{25B6}", WIN_W - 28, WIN_H / 2 - 12, 20, 24, 14, WHITE, CENTER, FONT_BOLD)
+
+-- tab bar
+local TAB_W, TAB_GAP, TAB_X0, TAB_Y, TAB_H = 100, 6.5, 12, 30, 24
+local tabObjs = {}
+local tabIndicator = reg(box(chrome, TAB_X0, TAB_Y + TAB_H, TAB_W, 3, GREEN))
+
+for i, name in ipairs(pageOrder) do
+	local x = TAB_X0 + (i - 1) * (TAB_W + TAB_GAP)
+	local tb = Instance.new("TextButton")
+	tb.AutoButtonColor = false
+	tb.Text = ""
+	tb.BackgroundColor3 = BTN_BG
+	tb.BorderSizePixel = 0
+	tb.Position = UDim2.fromOffset(x, TAB_Y)
+	tb.Size = UDim2.fromOffset(TAB_W, TAB_H)
+	tb.ClipsDescendants = true
+	tb.Parent = chrome
+
+	local stroke = Instance.new("UIStroke")
+	stroke.Color = DIM
+	stroke.Thickness = 1
+	stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+	stroke.Parent = tb
+	local sc = Instance.new("UIScale")
+	sc.Parent = tb
+
+	local fill = box(tb, 0, TAB_H, TAB_W, 0, WHITE, 0.86)
+	local num = label(tb, string.format("%02d", i), 6, 0, 18, TAB_H, 8, MID, LEFT)
+	local nm = label(tb, name, 22, 0, TAB_W - 26, TAB_H, 10, LIGHT, CENTER, FONT_HEAD)
+
+	local tobj = { btn = tb }
+	function tobj.setActive(active, instant)
+		local info = TweenInfo.new(instant and 0 or 0.3, Enum.EasingStyle.Quint, Enum.EasingDirection.Out)
+		TweenService:Create(tb, info, { BackgroundColor3 = active and LIGHT or BTN_BG }):Play()
+		TweenService:Create(nm, info, { TextColor3 = active and BG or LIGHT }):Play()
+		TweenService:Create(num, info, { TextColor3 = active and DARKTXT or MID }):Play()
+		TweenService:Create(stroke, info, { Color = active and LIGHT or DIM }):Play()
+	end
+
+	tb.MouseEnter:Connect(function()
+		hovered[tobj] = true
+		if i ~= currentPage then
+			tween(fill, 0.25, { Position = UDim2.fromOffset(0, 0), Size = UDim2.fromOffset(TAB_W, TAB_H) })
+			tween(stroke, 0.2, { Color = ACC.color })
+			scramble(nm, name, 0.2)
+		end
+	end)
+	tb.MouseLeave:Connect(function()
+		hovered[tobj] = nil
+		tween(fill, 0.25, { Position = UDim2.fromOffset(0, TAB_H), Size = UDim2.fromOffset(TAB_W, 0) })
+		tween(stroke, 0.2, { Color = (i == currentPage) and LIGHT or DIM })
+		tween(sc, 0.15, { Scale = 1 })
+	end)
+	tb.MouseButton1Down:Connect(function() tween(sc, 0.07, { Scale = 0.92 }) end)
+	tb.MouseButton1Up:Connect(function() tween(sc, 0.3, { Scale = 1 }, Enum.EasingStyle.Back) end)
+
+	tobj.nm = nm
+	tobj.name = name
+	tobj.index = i
+	tabObjs[i] = tobj
+end
+
+----------------------------------------------------------------
+-- Page switching
+----------------------------------------------------------------
+local function showPage(i, instant)
+	if i == currentPage and not instant then return end
+	currentPage = i
+	pageGen += 1
+	local gen = pageGen
+
+	for k, tobj in ipairs(tabObjs) do
+		tobj.setActive(k == i, instant)
+	end
+	tween(tabIndicator, instant and 0 or 0.45,
+		{ Position = UDim2.fromOffset(TAB_X0 + (i - 1) * (TAB_W + TAB_GAP), TAB_Y + TAB_H) },
+		Enum.EasingStyle.Back)
+	scramble(pageTag, string.format("[ %02d/05 ]", i), 0.4)
+
+	for k, pg in ipairs(pages) do
+		if k ~= i and pg.group.Visible then
+			for _, bo in ipairs(pg.buttons) do bo.unhover() end
+			tween(pg.group, 0.18, { GroupTransparency = 1 })
+			task.delay(0.2, function()
+				if currentPage ~= k then pg.group.Visible = false end
+			end)
+		end
+	end
+
+	local pg = pages[i]
+	pg.group.Visible = true
+	if instant then
+		pg.group.GroupTransparency = 0
+		pg.group.Position = UDim2.fromOffset(0, 0)
+		for _, bo in ipairs(pg.buttons) do bo.frame.Visible = true end
+	else
+		pg.group.GroupTransparency = 1
+		pg.group.Position = UDim2.fromOffset(0, 12)
+		tween(pg.group, 0.35, { GroupTransparency = 0, Position = UDim2.fromOffset(0, 0) })
+		for n, bo in ipairs(pg.buttons) do
+			bo.frame.Visible = false
+			task.delay(0.05 + n * 0.045, function()
+				if gen ~= pageGen then return end
+				bo.frame.Position = UDim2.fromOffset(bo.base.X - 28, bo.base.Y)
+				bo.frame.Visible = true
+				tween(bo.frame, 0.4, { Position = UDim2.fromOffset(bo.base.X, bo.base.Y) }, Enum.EasingStyle.Back)
+			end)
+		end
+		pageWipe.Position = UDim2.fromOffset(44, 108)
+		pageWipe.BackgroundTransparency = 0.15
+		tween(pageWipe, 0.5, { Position = UDim2.fromOffset(44, 488), BackgroundTransparency = 1 }, Enum.EasingStyle.Quad, Enum.EasingDirection.InOut)
+		kick = Vector2.new((rnd:NextNumber() < 0.5 and -1 or 1) * 0.5, 0)
+		log("PAGE -> " .. pageOrder[i])
+	end
+end
+
+for i, tobj in ipairs(tabObjs) do
+	tobj.btn.Activated:Connect(function()
+		local fl = box(tobj.btn, 0, 0, TAB_W, TAB_H, WHITE, 0.5)
+		tween(fl, 0.3, { BackgroundTransparency = 1 })
+		task.delay(0.32, function() fl:Destroy() end)
+		scramble(tobj.nm, tobj.name, 0.3)
+		showPage(i)
+	end)
+end
+showPage(1, true)
+
+----------------------------------------------------------------
+-- FX layer (ripples, boot flash) + global cursor gui
+----------------------------------------------------------------
+local fx = Instance.new("Frame")
+fx.Name = "FX"
+fx.BackgroundTransparency = 1
+fx.Size = UDim2.fromScale(1, 1)
+fx.ZIndex = 30
+fx.Parent = inner
+local flash = box(fx, 0, 0, WIN_W, WIN_H, WHITE, 1)
+
+local function ripple(p, delayTime)
+	if delayTime then task.wait(delayTime) end
+	local r, s = circle(fx, p.X, p.Y, 4, ACC.color, 2, 0)
+	tween(r, 0.65, { Size = UDim2.fromOffset(120, 120) })
+	tween(s, 0.65, { Transparency = 1 })
+	task.delay(0.7, function() r:Destroy() end)
+end
+
+-- reticle lives in its own ScreenGui so it works anywhere on screen
+local cursorGui = Instance.new("ScreenGui")
+cursorGui.Name = "FishGuyCursor"
+cursorGui.IgnoreGuiInset = true
+cursorGui.ResetOnSpawn = false
+cursorGui.DisplayOrder = 1000
+cursorGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+cursorGui.Parent = playerGui
+
+local reticle = Instance.new("Frame")
+reticle.AnchorPoint = Vector2.new(0.5, 0.5)
+reticle.Size = UDim2.fromOffset(44, 44)
+reticle.BackgroundTransparency = 1
+reticle.Visible = false
+reticle.Parent = cursorGui
+local retScale = Instance.new("UIScale")
+retScale.Parent = reticle
+local _, retStroke = circle(reticle, 22, 22, 11, GREEN, 1.5, 0.1)
+local spin = box(reticle, 0, 0, 44, 44, BG, 1)
+spin.AnchorPoint = Vector2.new(0.5, 0.5)
+spin.Position = UDim2.fromOffset(22, 22)
+reg(box(spin, 20, 0, 4, 8, GREEN))
+reg(box(spin, 20, 36, 4, 8, GREEN))
+reg(box(spin, 0, 20, 8, 4, GREEN))
+reg(box(spin, 36, 20, 8, 4, GREEN))
+box(reticle, 20, 20, 4, 4, WHITE)
+local retText = label(reticle, "", 34, 30, 130, 12, 9, GREEN, LEFT)
+
+local cursorHidden = false
+local function setCursorHidden(hidden)
+	if not HIDE_SYSTEM_CURSOR then return end
+	if hidden ~= cursorHidden then
+		cursorHidden = hidden
+		UserInputService.MouseIconEnabled = not hidden
+	end
+end
+
+----------------------------------------------------------------
+-- Open / close
+----------------------------------------------------------------
+function openWindow()
+	busy = true
+	minimized = false
+	minGlyph.Text = "-"
+	window.Visible = true
+	inner.Visible = false
+	window.BackgroundColor3 = ACC.color
+	window.BackgroundTransparency = 0
+	window.Size = UDim2.fromOffset(0, 2)
+	tweenWait(window, 0.25, { Size = UDim2.fromOffset(WIN_W, 2) }, Enum.EasingStyle.Quart)
+	inner.Visible = true
+	flash.BackgroundTransparency = 0.35
+	tween(flash, 0.6, { BackgroundTransparency = 1 })
+	tweenWait(window, 0.55, { Size = UDim2.fromOffset(WIN_W, WIN_H) })
+	window.BackgroundTransparency = 1
+	ready = true
+	busy = false
+end
+
+function closeWindow()
+	busy = true
+	ready = false
+	minimized = false
+	dragging = false
+	window.BackgroundColor3 = ACC.color
+	window.BackgroundTransparency = 0
+	tweenWait(window, 0.35, { Size = UDim2.fromOffset(WIN_W, 2) }, Enum.EasingStyle.Quint, Enum.EasingDirection.In)
+	inner.Visible = false
+	tweenWait(window, 0.2, { Size = UDim2.fromOffset(0, 2) })
+	window.Visible = false
+	busy = false
+end
+
+----------------------------------------------------------------
+-- Dragging (uses the live mouse position every frame = no glitching)
+----------------------------------------------------------------
+local dragOffset = Vector2.zero
+local dragIsTouch = false
+local touchStart, touchStartCenter
+
+local function clampCenter(c)
+	local vp = gui.AbsoluteSize
+	local hx, hy = WIN_W / 2, WIN_H / 2
+	return Vector2.new(
+		math.max(hx, math.min(vp.X - hx, c.X)),
+		math.max(hy, math.min(vp.Y - hy, c.Y))
+	)
+end
+
+topBar.InputBegan:Connect(function(input)
+	if not ready then return end
+	if input.UserInputType == Enum.UserInputType.MouseButton1 then
+		dragging = true
+		dragIsTouch = false
+		dragOffset = (window.AbsolutePosition + window.AbsoluteSize / 2) - UserInputService:GetMouseLocation()
+	elseif input.UserInputType == Enum.UserInputType.Touch then
+		dragging = true
+		dragIsTouch = true
+		touchStart = input.Position
+		touchStartCenter = window.AbsolutePosition + window.AbsoluteSize / 2
+		input.Changed:Connect(function()
+			if input.UserInputState == Enum.UserInputState.End then dragging = false end
+		end)
+	end
+end)
+
+UserInputService.InputChanged:Connect(function(input)
+	if dragging and dragIsTouch and input.UserInputType == Enum.UserInputType.Touch then
+		local d = input.Position - touchStart
+		local c = clampCenter(touchStartCenter + Vector2.new(d.X, d.Y))
+		window.Position = UDim2.fromOffset(c.X, c.Y)
+	end
+end)
+
+UserInputService.InputEnded:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1 then
+		dragging = false
+	end
+end)
+
+----------------------------------------------------------------
+-- Input: click ripple + toggle key
+----------------------------------------------------------------
+UserInputService.InputBegan:Connect(function(input, processed)
+	if input.UserInputType == Enum.UserInputType.MouseButton1 and ready and not dragging then
+		local p = UserInputService:GetMouseLocation() - inner.AbsolutePosition
+		if p.X >= 0 and p.X <= WIN_W and p.Y > 26 and p.Y <= WIN_H then
+			task.spawn(ripple, p)
+			task.spawn(ripple, p, 0.12)
+			if CFG.kick and next(hovered) == nil then
+				kick = Vector2.new(rnd:NextNumber(-0.35, 0.35), rnd:NextNumber(-0.35, 0.35))
+			end
+		end
+	end
+	if processed then return end
+	if input.KeyCode == TOGGLE_KEY and not busy then
+		task.spawn(window.Visible and closeWindow or openWindow)
+	end
+end)
+
+gui.Destroying:Connect(function()
+	UserInputService.MouseIconEnabled = true
+	cursorGui:Destroy()
+end)
+
+----------------------------------------------------------------
+-- Main loop
+----------------------------------------------------------------
+local smoothN = Vector2.zero
+local dragVel = Vector2.zero
+local lastCenter
+local retPos = Vector2.new(0, 0)
+local wasRet = false
+local sweepAng = 0
+local fpsAcc, fpsFrames = 0, 0
+local tickAcc, infoAcc = 0, 0
+local lastClock = ""
+local mouseWin = Vector2.zero
+
+RunService.RenderStepped:Connect(function(dt)
+	t += dt
+	local mouse = UserInputService:GetMouseLocation()
+
+	-- bubble drag (mouse): polled every frame so it can't glitch/desync,
+	-- same technique as the main window drag below. Runs even while the
+	-- window itself is hidden (i.e. while minimized).
+	if bubbleDragging and not bubbleIsTouch then
+		if UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton1) then
+			local c = clampToScreen(mouse + bubbleDragOffset, BUB / 2, BUB / 2)
+			bubble.Position = UDim2.fromOffset(c.X, c.Y)
+			if (mouse - bubbleMouseStart).Magnitude > 4 then bubbleMoved = true end
+		else
+			bubbleDragging = false
+		end
+	end
+
+	if inner.Visible then
+		local size = inner.AbsoluteSize
+
+		-- drag (mouse): follow the live cursor every frame
+		local dragCenter
+		if dragging and not dragIsTouch then
+			if UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton1) then
+				dragCenter = clampCenter(mouse + dragOffset)
+				window.Position = UDim2.fromOffset(dragCenter.X, dragCenter.Y)
+			else
+				dragging = false
+			end
+		end
+
+		local center = dragCenter or (inner.AbsolutePosition + size / 2)
+		local origin = center - size / 2
+		mouseWin = mouse - origin
+
+		----------------------------------------------------- parallax
+		if lastCenter then
+			local v = (center - lastCenter) / math.max(dt, 1 / 240)
+			dragVel = dragVel:Lerp(v, 1 - math.exp(-dt * 12))
+		end
+		lastCenter = center
+		local dN = Vector2.new(math.clamp(dragVel.X / 900, -1, 1), math.clamp(dragVel.Y / 900, -1, 1))
+
+		kick = kick * math.exp(-dt * 5)
+		local target = Vector2.zero
+		if CFG.parallax then
+			-- while actively dragging, ignore the raw mouse-to-center offset (it stays
+			-- roughly constant for the whole drag and was causing a stuck skew) and
+			-- rely only on drag velocity for a subtle motion feel
+			local raw = dragging and Vector2.zero or (mouse - center) / 360
+			target = Vector2.new(
+				math.clamp(raw.X + dN.X * 0.9 + kick.X, -1.3, 1.3),
+				math.clamp(raw.Y + dN.Y * 0.9 + kick.Y, -1.3, 1.3)
+			)
+		end
+		smoothN = smoothN:Lerp(target, 1 - math.exp(-dt * 7))
+
+		local prox = math.clamp(1 - smoothN.Magnitude, 0, 1)
+		for _, L in ipairs(layers) do
+			local o = smoothN * (-L.shift * CFG.parMul)
+			if L.glitchy then o += glitchOff end
+			L.frame.Position = UDim2.fromOffset(WIN_W / 2 + o.X, WIN_H / 2 + o.Y)
+			L.scale.Scale = 1 + L.zoom * prox * CFG.parMul
+		end
+
+		----------------------------------------------------- background
+		stripeHolder.Position = UDim2.fromOffset((t * 10) % 70, 0)
+		sweepBar.Position = UDim2.fromOffset(0, ((t * 0.28) % 1) * (WIN_H + 70) - 70)
+
+		----------------------------------------------------- grid reacts to cursor (anywhere on screen)
+		local gp = gridLayer.Position
+		local gx = mouseWin.X - (gp.X.Offset - WIN_W / 2)
+		local gy = mouseWin.Y - (gp.Y.Offset - WIN_H / 2)
+		for _, p in ipairs(plusList) do
+			local dx, dy = p.x - gx, p.y - gy
+			local k = math.clamp(1 - math.sqrt(dx * dx + dy * dy) / 100, 0, 1)
+			k = k * k
+			p.l.TextColor3 = DIM:Lerp(ACC.color, k)
+			p.l.TextSize = 14 + 10 * k
+			p.l.Rotation = k * 45
+		end
+
+		----------------------------------------------------- home page (updates panel)
+		if pages[1].group.Visible then
+			recDot.BackgroundTransparency = (math.sin(t * 4) > 0) and 0 or 0.85
+		end
+
+		----------------------------------------------------- gauges
+		for _, g in ipairs(gauges) do
+			local level = 0.55 + 0.33 * math.sin(t * 0.9 + g.phase) + 0.08 * math.sin(t * 3.1 + g.phase * 2)
+			level = math.clamp(level, 0, 1)
+			local n = math.floor(level * 16 + 0.5)
+			if n ~= g.last then
+				g.last = n
+				for i = 1, 16 do
+					local fromBottom = 17 - i
+					local seg = g.segs[i]
+					if fromBottom <= n then
+						seg.BackgroundColor3 = (fromBottom == n) and ACC.color or LIGHT
+						seg.BackgroundTransparency = 0
+					else
+						seg.BackgroundColor3 = DIM
+						seg.BackgroundTransparency = 0.4
+					end
+				end
+				g.pct.Text = math.floor(level * 100) .. "%"
+			end
+		end
+		blinkL.BackgroundTransparency = (math.sin(t * 5) > 0) and 0 or 0.8
+		blinkR.BackgroundTransparency = (math.sin(t * 3 + 1) > 0) and 0 or 0.8
+		onlineTag.TextTransparency = (math.sin(t * 4) > -0.3) and 0 or 0.7
+		barDash.BackgroundTransparency = (math.sin(t * 6) > 0) and 0 or 0.6
+
+		----------------------------------------------------- progress / clock / ticks
+		local prog = (t * 0.12) % 1
+		progFill.Size = UDim2.fromOffset(188 * prog, 6)
+		progLabel.Text = string.format("%02d/06", math.floor(prog * 6) + 1)
+
+		local c = os.date("%I:%M:%S %p   %m/%d/%Y")
+		if c ~= lastClock then lastClock = c; clockLabel.Text = c end
+
+		tickAcc += dt
+		if tickAcc > 0.12 then
+			tickAcc = 0
+			for _, s in ipairs(tickSquares) do
+				local r = rnd:NextNumber()
+				s.BackgroundColor3 = r < 0.15 and ACC.color or (r < 0.5 and WHITE or MID)
+			end
+		end
+
+		dot.BackgroundColor3 = dragging and ACC.color or BG
+		panelStroke.Color = dragging and ACC.color or DIM
+
+		fpsAcc += dt
+		fpsFrames += 1
+		if fpsAcc >= 0.5 then
+			fpsValue = math.floor(fpsFrames / fpsAcc + 0.5)
+			fpsLabel.Text = string.format("FPS %03d", fpsValue)
+			fpsAcc, fpsFrames = 0, 0
+		end
+
+		----------------------------------------------------- live data card
+		infoAcc += dt
+		if infoAcc > 0.2 then
+			infoAcc = 0
+			local pg = pages[currentPage]
+			if pg and pg.info then pg.info() end
+		end
+	end
+
+	----------------------------------------------------------- reticle (always, anywhere on screen)
+	local showRet = CFG.reticle and window.Visible
+	reticle.Visible = showRet
+	setCursorHidden(showRet)
+	if showRet then
+		if not wasRet then retPos = mouse end
+		retPos = retPos:Lerp(mouse, 1 - math.exp(-dt * 35))
+		reticle.Position = UDim2.fromOffset(retPos.X, retPos.Y)
+		spin.Rotation = (t * 70) % 360
+
+		local hover = next(hovered) ~= nil
+		local pressed = UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton1)
+		local goal = pressed and 0.7 or (hover and 1.3 or 1)
+		retScale.Scale = retScale.Scale + (goal - retScale.Scale) * math.min(1, dt * 18)
+
+		local locked = false
+		local hot = hover or locked
+		retStroke.Color = hot and WHITE or ACC.color
+		retText.TextColor3 = hot and WHITE or ACC.color
+		retText.Text = string.format("%s %04d,%04d", hover and "SELECT" or (locked and "LOCK" or "POS"), mouse.X, mouse.Y)
+	end
+	wasRet = showRet
+end)
+
+----------------------------------------------------------------
+-- Subscribe prompt (shown once, before the HUD boots)
+----------------------------------------------------------------
+local YT_LINK = "HTTPS://youtube.com/@LilFishGuy"
+
+local function copyToClipboard(text)
+	pcall(function()
+		if typeof(setclipboard) == "function" then
+			setclipboard(text)
+		elseif typeof(toclipboard) == "function" then
+			toclipboard(text)
+		end
+	end)
+end
+
+local function showSubscribePrompt(onDone)
+	local promptGui = Instance.new("ScreenGui")
+	promptGui.Name = "FishGuySubPrompt"
+	promptGui.IgnoreGuiInset = true
+	promptGui.ResetOnSpawn = false
+	promptGui.DisplayOrder = 50
+	promptGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+	promptGui.Parent = playerGui
+
+	local dim = box(promptGui, 0, 0, 0, 0, Color3.new(0, 0, 0), 1)
+	dim.Size = UDim2.fromScale(1, 1)
+	dim.ZIndex = 1
+	tween(dim, 0.3, { BackgroundTransparency = 0.45 })
+
+	local CARD_W, CARD_H = 380, 210
+	local card = Instance.new("Frame")
+	card.AnchorPoint = Vector2.new(0.5, 0.5)
+	card.Position = UDim2.fromScale(0.5, 0.5)
+	card.Size = UDim2.fromOffset(0, 0)
+	card.BackgroundColor3 = BG
+	card.BorderSizePixel = 0
+	card.ClipsDescendants = true
+	card.ZIndex = 2
+	card.Parent = promptGui
+
+	local cardStripes = box(card, 0, 0, CARD_W + 40, CARD_H + 40, BG, 1)
+	cardStripes.ZIndex = 2
+	for i = -3, 9 do
+		local bar = box(cardStripes, i * 46, -80, 20, 420, STRIPE)
+		bar.ZIndex = 2
+		bar.Rotation = 35
+	end
+
+	outline(card, 4, 4, CARD_W - 8, CARD_H - 8, MID).ZIndex = 3
+	local accBar = box(card, 4, 4, CARD_W - 8, 4, GREEN); accBar.ZIndex = 3
+	local dot = box(card, 20, 26, 6, 6, GREEN); dot.ZIndex = 3
+	local t1 = label(card, "FISHGUY // NOTICE", 34, 20, 260, 18, 15, WHITE, LEFT, FONT_HEAD); t1.ZIndex = 3
+	label(card, "[ HUD BOOT SEQUENCE ]", 24, 44, 260, 12, 9, MID, LEFT).ZIndex = 3
+
+	local msg = label(card, "Subscribe to FishGuy on YouTube\nto keep these free.", 24, 72, CARD_W - 48, 44, 14, LIGHT, LEFT)
+	msg.ZIndex = 3
+	msg.TextWrapped = true
+
+	box(card, 24, 120, CARD_W - 48, 24, DIM, 0.35).ZIndex = 3
+	outline(card, 24, 120, CARD_W - 48, 24, MID).ZIndex = 3
+	local linkLbl = label(card, YT_LINK, 32, 120, CARD_W - 64, 24, 11, GREEN, LEFT, FONT_SMALL)
+	linkLbl.ZIndex = 4
+	local copiedTag = label(card, "", CARD_W - 90, 120, 60, 24, 9, GREEN, RIGHT)
+	copiedTag.ZIndex = 4
+
+	local okBtn = Instance.new("TextButton")
+	okBtn.AutoButtonColor = false
+	okBtn.Text = ""
+	okBtn.BackgroundColor3 = BTN_BG
+	okBtn.BorderSizePixel = 0
+	okBtn.Position = UDim2.fromOffset(24, 158)
+	okBtn.Size = UDim2.fromOffset(CARD_W - 48, 34)
+	okBtn.ZIndex = 3
+	okBtn.Parent = card
+	local okStroke = Instance.new("UIStroke")
+	okStroke.Color = GREEN
+	okStroke.Thickness = 1
+	okStroke.Parent = okBtn
+	local okFill = box(okBtn, 0, 0, 0, 34, WHITE, 0.9); okFill.ZIndex = 3
+	local okLabel = label(okBtn, "OK — COPY LINK & CONTINUE", 0, 0, CARD_W - 48, 34, 12, LIGHT, CENTER, FONT_SMALL)
+	okLabel.ZIndex = 4
+
+	okBtn.MouseEnter:Connect(function()
+		tween(okFill, 0.3, { Size = UDim2.fromOffset(CARD_W - 48, 34) })
+		tween(okLabel, 0.2, { TextColor3 = BG })
+	end)
+	okBtn.MouseLeave:Connect(function()
+		tween(okFill, 0.25, { Size = UDim2.fromOffset(0, 34) })
+		tween(okLabel, 0.2, { TextColor3 = LIGHT })
+	end)
+
+	okBtn.Activated:Connect(function()
+		copyToClipboard(YT_LINK)
+		scramble(copiedTag, "COPIED", 0.2)
+		task.delay(0.05, function()
+			tween(dim, 0.25, { BackgroundTransparency = 1 })
+			local tw = tween(card, 0.25, { Size = UDim2.fromOffset(0, 0) }, Enum.EasingStyle.Quint, Enum.EasingDirection.In)
+			tw.Completed:Wait()
+			promptGui:Destroy()
+			if onDone then onDone() end
+		end)
+	end)
+
+	tween(card, 0.35, { Size = UDim2.fromOffset(CARD_W, CARD_H) }, Enum.EasingStyle.Back)
+end
+
+----------------------------------------------------------------
+-- Boot
+----------------------------------------------------------------
+showSubscribePrompt(function()
+	task.spawn(openWindow)
+end)
